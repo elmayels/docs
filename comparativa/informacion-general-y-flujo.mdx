@@ -1,0 +1,214 @@
+---
+title: "Información general y flujo"
+description: "Proceso desde Analizar comparativa hasta el dashboard, la revisión y el cierre del mercado."
+sidebarTitle: "Flujo de comparativa"
+---
+
+**Producto:** Chanix IA · Comparador de APU  
+**Versión documentada:** V1.5.62  
+**Tipo de página:** Información general / Especificación funcional
+
+<Info>
+
+**Estado de documentación:** Basada en inspección del código ensamblado de V1.5.62. No representa una auditoría de ejecución de Railway.
+
+</Info>
+
+**Páginas relacionadas:** [02 · Reglas de negocio y cálculo](/comparativa/reglas-de-negocio-y-calculo) · [03 · Integraciones, IA y arquitectura](/comparativa/integraciones-ia-y-arquitectura)
+
+## 1. Objetivo
+
+Permitir al analista comparar las propuestas económicas de **uno a cinco proveedores**, partiendo de sus catálogos de conceptos y matrices de análisis de precios unitarios (APU), para obtener una referencia de mercado trazable por insumo, servicio y proveedor.
+
+El proceso toma como base los archivos declarados por los contratistas y los contrasta con **Construbase** y **OPUS**, utilizando un motor de reglas técnicas y, cuando están habilitadas y disponibles, capacidades de IA para encontrar y evaluar referencias. El analista conserva la responsabilidad de **confirmar u omitir** cada insumo antes de cerrar la revisión del mercado.
+
+La IA **no sustituye el precio del catálogo** ni altera las cotizaciones originales del contratista. La composición económica, la comparación de presupuestos y los resultados de la corrida se calculan en el backend.
+
+## 2. Alcance
+
+**Incluido**
+
+- Alta de una comparación con archivos Excel de conceptos y APU por proveedor.
+- Prevalidación de archivos, interpretación de sus estructuras y normalización.
+- Extracción de conceptos ejecutables y renglones de insumo APU.
+- Búsqueda local e híbrida de referencias de mercado en Construbase y OPUS.
+- Cálculo de mercado por insumo, APU, concepto y cantidad del catálogo.
+- Creación de corrida, dashboard, archivos Excel y diagnóstico.
+- Revisión, confirmación, omisión justificada, guardado y cierre de mercado.
+- Historial de revisiones económicas y controles de acceso por corrida.
+
+**No incluido en la ejecución inicial obligatoria**
+
+- Consulta generalizada de precios en Internet: «Buscar Internet» permanece deshabilitado en V1.5.62.
+- Validación humana automática: encontrar un candidato no equivale a «Confirmado».
+- Certificación de que todos los precios de mercado tienen referencia independiente: la cobertura puede ser incompleta.
+- Actualización retroactiva de todas las corridas históricas al cambiar los catálogos.
+
+## 3. Usuarios y componentes
+
+| Participante | Responsabilidad |
+|---|---|
+| Analista | Carga archivos, revisa referencias y precios, confirma/omite, guarda cambios y finaliza mercado. |
+| Super Admin | Puede reabrir excepcionalmente una corrida finalizada con justificación; administra accesos especiales. |
+| Frontend | Captura los archivos, muestra validaciones, crea la corrida y presenta la grilla, dashboard y descargas. |
+| API FastAPI | Autoriza, valida, orquesta lectura, matching, cálculo, persistencia y revisión. |
+| Parser de Excel | Extrae catálogo de servicios y descompone matrices APU sin enviar libros completos a los proveedores de IA. |
+| Catálogo de mercado | Carga referencias locales Construbase y OPUS con sus unidades, precios e identidad de origen. |
+| Matcher híbrido | Filtra candidatos, consulta IA opcional y devuelve la referencia seleccionada o resultado sin match. |
+| Motor económico | Recalcula el mercado en el carril separado del precio ofertado. |
+| RunStorage / workflow | Conserva snapshots, revisiones económicas, estados de validación y cierre por corrida. |
+
+## 4. Entradas de la comparación
+
+En la pantalla **Nueva comparación** el usuario proporciona:
+
+| Campo | Obligatorio | Descripción |
+|---|---|---|
+| Nombre del proyecto | Sí | Identifica la comparación. Debe ser único según la validación de la aplicación. |
+| Lugar | No | Metadato del proyecto. |
+| Planta | No | Metadato del proyecto. |
+| Proveedor | Sí, 1–5 | Nombre del contratista, máximo 50 caracteres. |
+| Catálogo de conceptos | Sí, por proveedor | Excel `.xlsx` / `.xlsm` con servicios, cantidades, precios unitarios e importes. |
+| Matriz APU/PU | Sí, por proveedor | Excel `.xlsx` / `.xlsm` con renglones de materiales, mano de obra, maquinaria, operadores y cargos. |
+
+Para cada proveedor se captura un par de archivos. La aplicación puede detectar que el catálogo y la matriz fueron colocados en el campo contrario e intercambiarlos **internamente** cuando sus estructuras lo permiten.
+
+## 5. Flujo de extremo a extremo
+
+```mermaid
+flowchart TD
+    A[Analista pulsa Analizar comparativa] --> B[Prevalidar archivos por proveedor]
+    B --> C{¿Existen errores bloqueantes?}
+    C -->|Sí| D[Mostrar errores y detener]
+    C -->|No| E[Crear corrida real]
+    E --> F[Leer conceptos y matrices APU]
+    F --> G[Identificar insumos elegibles y deduplicar]
+    G --> H[Consultar Construbase y OPUS]
+    H --> I[Matching local e IA opcional]
+    I --> J[Calcular P.U. y montos de mercado]
+    J --> K[Relacionar APU con conceptos]
+    K --> L[Generar corrida, Excel, dashboard y diagnóstico]
+    L --> M[Analista revisa y confirma/omite insumos]
+    M --> N{¿100 % validado y sin borradores?}
+    N -->|No| M
+    N -->|Sí| O[Finalizar edición de mercado]
+    O --> P[Corrida cerrada para escritura de mercado]
+```text
+
+### 5.1. Paso A — Prevalidación
+
+Al pulsar **Analizar comparativa**, el frontend solicita al servidor validar los archivos mediante:
+
+```http
+POST /api/comparisons/validate-upload
+Content-Type: multipart/form-data
+
+provider_names: <nombre de cada proveedor>
+concept_files: <archivo de conceptos por proveedor>
+matrix_files: <archivo APU por proveedor>
+```text
+
+La prevalidación comprueba extensión y estructura del Excel, tamaño permitido, contenido interno y condiciones mínimas de lectura. El límite predeterminado observado es de **25 MiB por archivo** mediante `CHANIX_MAX_UPLOAD_MB` (con límite configurable máximo de 50 MiB). El backend vuelve a validar al ejecutar, incluso si el navegador ya había aprobado los archivos. **La prevalidación no llama a Voyage o Claude.**
+
+Cuando la respuesta indica `valid: false`, el flujo se detiene; se presentan los errores específicos para que el analista corrija los archivos.
+
+### 5.2. Paso B — Creación de corrida
+
+Si los archivos son aceptados, el navegador envía:
+
+```http
+POST /api/comparisons/real-run
+Content-Type: multipart/form-data
+
+clientRequestId: <identificador aleatorio de solicitud>
+projectName: <nombre del proyecto>
+place: <ubicación opcional>
+plant: <planta opcional>
+provider_names: <nombre de cada proveedor>
+concept_files: <archivo por proveedor>
+matrix_files: <archivo por proveedor>
+```text
+
+`clientRequestId` ayuda a identificar una petición aunque se pierda la respuesta HTTP, evitando confundir reintentos con nuevas cargas. Los archivos Excel llegan **a Chanix**, no íntegros a una IA externa.
+
+### 5.3. Paso C — Extracción de conceptos
+
+El backend busca hojas compatibles con el catálogo de conceptos, interpreta encabezados equivalentes y obtiene:
+
+- Identificador/código y descripción del servicio.
+- Unidad de servicio, cantidad del catálogo, P.U. e importe ofertado.
+- Encabezados/capítulos y orden original de cotización.
+- Identidades para relacionar el concepto con su APU, incluidos escenarios con códigos repetidos.
+
+Una fila ejecutable requiere unidad, cantidad positiva y P.U. o importe válido. Los títulos, subtotales y notas se excluyen del universo de servicios a comparar. Si procede, se recupera un importe faltante como `cantidad × P.U.` o el P.U. como `importe ÷ cantidad`.
+
+Chanix ordena por importe para identificar los servicios que representan el **80 % acumulado del presupuesto de cada proveedor**. Es una priorización de revisión, **no una restricción que limite la búsqueda de mercado al 80 %**.
+
+### 5.4. Paso D — Extracción de matrices APU
+
+El parser reconoce hojas de PU/APU, detecta bloques de análisis, líneas de materiales, mano de obra, maquinaria, básicos, subtotales, operadores de cálculo (`×` y `÷`) y porcentajes. Mantiene los datos de origen y referencias de celdas/fórmulas para conciliación. Los **multiplicadores de cuadrilla**, subtotales y agrupadores no deben tratarse automáticamente como insumos independientes.
+
+Para evitar búsquedas repetidas, agrupa dentro del proveedor los renglones que comparten **código, descripción, unidad y tipo técnico normalizados**. El precio de mercado de una referencia puede reutilizarse, pero sus cantidades e importes se calculan para cada aparición APU.
+
+### 5.5. Paso E — Referencias de mercado y cálculo
+
+Chanix carga Construbase y OPUS desde `data/`, filtra los candidatos técnicamente incompatibles y aplica el matcher local e IA opcional. El resultado es una referencia trazable con unidad y precio original, o un estado sin referencia adecuada. Véanse los detalles en las páginas 02 y 03.
+
+El motor recompone el mercado del APU conservando operadores, cantidades, rendimientos, porcentajes y cargos de la matriz. A continuación, aplica el **P.U. de mercado del servicio a la cantidad del catálogo de conceptos** para comparar importes ofertados y de mercado en la misma base.
+
+### 5.6. Paso F — Resultados y revisión
+
+La API devuelve un identificador de corrida `REAL-CMP-...`, el estado de procesamiento y referencias a resultados. El frontend puede mostrar:
+
+- **Dashboard** con presupuesto, mercado, diferencias, cobertura y composición APU.
+- **Comparativa** con precios e importes ofertados y de mercado.
+- **Detalle por proveedor** con insumos, operaciones, fuentes y estados.
+- **Validaciones** y **Métricas de Riesgo**, cuando proceden.
+- **Diagnóstico** automático local o externo si la configuración de IA lo permite.
+
+El procesamiento inicial puede devolver `COMPLETED_WITH_WARNINGS`: esto no supone que el analista ya confirmó el mercado. La revisión humana es una fase posterior.
+
+## 6. Flujo de revisión y cierre de mercado (V1.5.62)
+
+| Paso | Acción del analista | Resultado |
+|---|---|---|
+| 1 | Abrir «Revisar insumos de mercado» | Se muestran grupos únicos por proveedor y su estado. |
+| 2 | Abrir «Editar» | Permite revisar/cambiar origen, referencia y P.U. dentro del detalle. |
+| 3 | Alternar «Confirmado / Por analizar» | Marca o desmarca la validación dentro del borrador unificado. |
+| 4 | Omitir un insumo | Requiere motivo y una confirmación. No elimina económicamente el insumo del APU. |
+| 5 | Continuar con otros insumos | Permitido aunque existan cambios pendientes de guardar. |
+| 6 | «Guardar todos los cambios» | Persiste confirmaciones y, si hubo cambios económicos, crea una revisión económica. |
+| 7 | «Finalizar edición de mercado» | Se habilita si todos los grupos están confirmados u omitidos y no hay borradores pendientes. |
+
+Al finalizar, la corrida queda en **solo lectura para modificaciones de mercado**. Los reportes, dashboard e historial permanecen disponibles. Una reapertura excepcional corresponde a Super Admin, con justificación. La finalización **no afecta otras corridas**.
+
+## 7. Estados y resultados
+
+| Estado / situación | Significado |
+|---|---|
+| Por analizar | Hay referencia sugerida o heredada, pero falta aceptación explícita en esta corrida. |
+| Confirmado | El analista ha aceptado la referencia y el valor, o ha guardado una edición de mercado. |
+| Omitido | Queda fuera del requisito de validación con motivo; no se elimina del cálculo económico. |
+| Modificado sin guardar | El cambio solo existe en el borrador de trabajo y bloquea la finalización, no la revisión de otros insumos. |
+| Sin referencia de mercado | No se obtuvo equivalente independiente; no debe confundirse un cero provisional con precio de mercado observado. |
+| Corrida finalizada | Ninguna interfaz/API de mercado debe aceptar nuevas escrituras hasta reapertura autorizada. |
+
+## 8. Referencias funcionales y criterios de aceptación
+
+1. La prevalidación nunca debe lanzar matching ni generar una corrida cuando hay errores bloqueantes.
+2. La cotización original debe permanecer separada de todos los ajustes de mercado.
+3. Una sola referencia técnica podrá cubrir múltiples apariciones equivalentes, sin alterar sus cantidades.
+4. Un resultado del matcher, aunque sea exacto, debe permitir revisión humana.
+5. Un precio heredado de otra corrida no debe marcarse automáticamente como confirmado en la nueva.
+6. Los borradores no deben bloquear la revisión de otros insumos; sí deben bloquear el cierre.
+7. El cierre solo puede afectar la corrida seleccionada, y el backend debe rechazar operaciones de escritura posteriores.
+
+## 9. Referencias de implementación
+
+- `frontend/assets/app.js`: `comparisonNew()`, `prevalidateComparison()`, `#runComparison`, `comparisonResults()`.
+- `backend/main.py`: endpoints de validación, creación, dashboard y revisión.
+- `backend/real_data.py`: `parse_concepts()`, `parse_matrix()`, cálculo y asociación de conceptos.
+- `backend/run_storage.py`: snapshots e historial.
+- `backend/market_workflow.py`: confirmaciones, omisiones y cierre.
+
+**Nota de vigencia:** esta especificación corresponde al código local ensamblado de V1.5.62. Los modelos, flags, índices y llamadas efectivamente utilizados en Railway deben validarse con sus registros operativos.

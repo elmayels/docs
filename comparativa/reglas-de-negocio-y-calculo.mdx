@@ -1,0 +1,204 @@
+---
+title: "Reglas de negocio y cálculo"
+description: "Reglas funcionales del APU, selección de referencias, estados y cálculo de precios de mercado."
+sidebarTitle: "Reglas y cálculo"
+---
+
+**Producto:** Chanix IA · Comparador APU  
+**Versión documentada:** V1.5.62  
+**Tipo de página:** Reglas funcionales / Motor económico  
+**Páginas relacionadas:** [01 · Información general y flujo](/comparativa/informacion-general-y-flujo) · [03 · Integraciones, IA y arquitectura](/comparativa/integraciones-ia-y-arquitectura)
+
+## 1. Principios de negocio
+
+**RN-001. Fuente económica del contratista.** Los precios, cantidades, operadores y fórmulas de los archivos del proveedor constituyen la oferta original; no se sobrescriben al obtener referencias de mercado ni cuando el analista modifica estas últimas.
+
+**RN-002. Referencia independiente.** Un precio de mercado solo se considera observado en un catálogo cuando existe un registro elegible en Construbase u OPUS, con precio, unidad y descripción rastreables. La IA no inventa P.U., códigos de referencia ni unidades.
+
+**RN-003. Equivalencia técnica antes del precio.** Una coincidencia textual o un precio parecido no bastan para sustituir un insumo. Deben respetarse familia, categoría, características explícitas y unidades compatibles.
+
+**RN-004. Decisión humana.** «Confirmado» equivale a aceptación por el analista en la corrida actual. El estado automático, la recomendación de IA y la memoria de corridas anteriores no sustituyen esta decisión.
+
+**RN-005. Unicidad técnica.** Se puede revisar una referencia una vez por grupo de insumos equivalentes del mismo proveedor, propagando el P.U. de referencia a sus apariciones, pero sin homogeneizar sus operadores o cantidades.
+
+**RN-006. Separación de revisiones.** El precio ofertado no cambia cuando se actualiza el mercado. Cada actualización económica publicada mantiene historial y no altera otras corridas.
+
+## 2. Extracción de conceptos del proveedor
+
+El catálogo es la fuente de **servicios ejecutables** y de la cantidad final de obra contra la cual se comparan los precios unitarios ofertados y de mercado.
+
+| Campo extraído | Regla |
+|---|---|
+| Código y descripción | Se conserva el identificador/orden original; puede existir código repetido y requiere vínculo canónico al APU. |
+| Unidad | Debe ser válida para que la fila sea ejecutable. |
+| Cantidad | Debe ser positiva. |
+| Precio unitario | Se toma del contratista o, si procede, `importe / cantidad`. |
+| Importe | Se toma del contratista o, si procede, `cantidad × P.U.`. |
+| Capítulos y agrupadores | Se conservan para organización, pero no se tratan como conceptos ejecutables por sí solos. |
+
+**RN-007. Regla 80/20.** El sistema ordena los conceptos ejecutables por costo ofertado y marca los que alcanzan o superan el 80 % acumulado de cada proveedor. Esta selección **prioriza** el análisis; el matcher no se limita a los conceptos marcados.
+
+## 3. Identificación de bloques APU e insumos
+
+La matriz PU/APU se analiza por bloques asociados al servicio/concepto. Cada renglón útil conserva:
+
+- Código, descripción y unidad del insumo.
+- Tipo: **MATERIAL**, **MO**, **MAQUINARIA** o sección de básicos según el parser.
+- P.U. del contratista, cantidad o rendimiento y operador (`×` o `÷`).
+- Importe y referencias de celdas o fórmulas para conciliación.
+- Contexto del servicio, necesario para evaluar pertinencia técnica.
+- Cargos porcentuales, subtotales, costo directo, indirectos, financiamiento y utilidad cuando estén en la matriz.
+
+**RN-008. Líneas no equivalentes a insumos.** Los encabezados, subtotales, renglones estructurales, porcentajes y el indicador «No. de cuadrillas» no deben originar por sí solos una nueva referencia de mercado. Los multiplicadores de cuadrilla intervienen en el cálculo conforme a su operador, sin duplicar la compra de insumos.
+
+**RN-009. Elegibilidad de matching.** Un renglón entra en búsqueda automática cuando no tiene ya un mercado declarado, existe un catálogo cargado y dispone de los datos técnicos/económicos requeridos; no deben procesarse porcentajes como insumos de compra.
+
+**RN-010. Deduplicación.** La clave normalizada combina **código + descripción + unidad + categoría** dentro de la matriz. Un match reutilizado no modifica la composición económica de las apariciones.
+
+## 4. Catálogos y fuentes
+
+**Construbase (archivo consolidado):** se selecciona el archivo más reciente según el nombre `construdata-MMYYYY.xlsx` y se clasifican las hojas por tipo:
+
+| Hoja | Tipo | P.U. leído |
+|---|---|---|
+| `Material` | MATERIAL | Columna `Costo`. |
+| `ManoObra` | MO | Columna `CostoTotal`. |
+| `Maquinaria` | MAQUINARIA | Columna `Costo`. |
+
+El archivo comprobado `construdata-102026.xlsx` contenía **48.949 materiales, 92 conceptos de MO y 69 de Maquinaria** (49.110 referencias válidas). La cifra corresponde al archivo suministrado, no certifica lo desplegado en Railway. Cuando el consolidado es válido, los Excel anteriores separados de Construbase **no se agregan**.
+
+**OPUS:** se carga de archivos `opus-*.xlsx`, leyendo posicionalmente código, descripción, unidad y precio. En las pruebas del catálogo aportado se habían encontrado **71.993** referencias. Las fuentes siguen siendo independientes y su origen se conserva en cada elección.
+
+**RN-011. Validación de origen.** Se descartan registros de catálogo sin descripción, sin unidad o con precio no positivo o inválido. Una referencia no debe perder identidad: deben mantenerse código, texto, unidad, archivo/fila y origen.
+
+**RN-012. Preferencia Construbase.** Construbase puede prevalecer frente a OPUS **cuando los candidatos son de adecuación técnica comparable**; no prevalece si existe incompatibilidad demostrada. El P.U. ofertado del contratista es una señal de alerta, nunca justificación suficiente para elegir un candidato.
+
+## 5. Reglas del matching técnico
+
+### 5.1. Obtención de candidatos
+
+1. Buscar coincidencias de código/descripción y términos normalizados en ambas fuentes.
+2. Aplicar filtros de categoría y unidad, más especificaciones explícitas.
+3. Añadir candidatos semánticos cuando existe índice Voyage válido y credenciales.
+4. Reordenar candidatos mediante Voyage Rerank cuando corresponde.
+5. Solicitar a Claude términos adicionales **solo si** el conjunto combinado carece de candidatos y la función está disponible.
+6. Solicitar a Claude decisión sobre una lista **cerrada** si hay opciones ambiguas o señales de anomalía.
+7. Aplicar el veto final de compatibilidad técnica, registrar origen y hasta cinco alternativas para revisión.
+
+La búsqueda local inicial llega a tomar hasta **32 resultados por fuente**, combinando luego un subconjunto de las primeras **12 por fuente**. Estas cifras son detalles del código auditado, no garantías contractuales de resultados.
+
+### 5.2. Evaluación de compatibilidad
+
+| Resultado técnico | Interpretación | Uso |
+|---|---|---|
+| `equivalent` | Sin conflicto en los atributos técnicos disponibles. | Puede ser candidato principal, pero aún requiere confirmación humana. |
+| `partial` | Evidencia incompleta de características o unidad. | Se puede mostrar con revisión requerida. |
+| `incompatible` | Existe contradicción técnica comprobable. | Excluido de selección automática. |
+
+Se comparan tipo, familia, marca explícita, calibre, espesor, resistencia, perfil y medidas cuando aparecen en las descripciones. Una coincidencia por palabras no anula la contradicción de una especificación.
+
+**RN-013. Regla de unidad.** Unidades no convertibles deben bloquear la selección. El código admite equivalencia temporal `HR/HOR ↔ JOR` en ciertas rutas, pero la **normalización automática del precio está implementada explícitamente para MO**; la selección manual de Maquinaria usa otra conversión. **Debe probarse la ruta automática de Maquinaria antes de asumir que aplica siempre ocho horas.**
+
+### 5.3. Origen de resolución del matching
+
+| Método registrado | Significado |
+|---|---|
+| `catalog_exact` | Identidad literal de catálogo y unidad. |
+| `ai_hybrid` | Selección con evaluación técnica de Claude. |
+| `ai_voyage` | Asistencia de Voyage sin elección de Claude. |
+| `ai_partial` | Selección parcial asistida por IA. |
+| `degraded_local` | Se resolvió mediante ruta local sin validación IA suficiente. |
+| `ai_review_no_match` | La evaluación IA no encontró alternativa adecuada. |
+| `provider_fallback` | No existe referencia independiente adecuada en esa decisión. |
+
+**RN-014. Umbral de anomalía de precio.** Si la razón entre precios resulta mayor o igual que `CHANIX_PRICE_ANOMALY_RATIO` (por defecto 3,0), se emite una alerta para revisión. No debe reemplazarse una selección técnica por la opción cuyo precio se asemeja más al ofrecido. Las puntuaciones de IA **no son probabilidades calibradas de exactitud del precio**.
+
+## 6. Reutilización de referencias históricas
+
+La memoria de mercado puede aplicar decisiones previamente confirmadas a una **nueva corrida**, después del parsing y antes de la generación de resultados:
+
+- Si el registro histórico corresponde a una referencia independiente y sigue siendo compatible, se reutilizan identidad/origen/precio y trazabilidad conforme a las reglas vigentes.
+- Si la elección histórica era **Proveedor** (fallback), se recupera la decisión, pero se utiliza el P.U. del **contratista de la nueva corrida**, no el precio ofertado históricamente por otro proveedor.
+- Si la referencia presenta ambigüedad, incompatibilidad o vigencia insuficiente, permanece pendiente de revisión.
+- La copia del valor **no** implica confirmar automáticamente el insumo en la nueva corrida.
+- No se modifican las corridas de origen por consultar la memoria.
+
+## 7. Reglas económicas del APU y del servicio
+
+### 7.1. Importe granular del insumo
+
+| Operador APU | Cálculo de mercado |
+|---|---|
+| Multiplicación `×` | `mercado_importe = mercado_PU × cantidad_APU` |
+| División `÷` | `mercado_importe = mercado_PU ÷ cantidad_APU` con cantidad distinta de cero |
+
+El P.U. de referencia se normaliza previamente **solo si la conversión está respaldada por la ruta de cálculo correspondiente**. Las equivalencias horarias conocidas son `HOR → JOR: × 8` y `JOR → HOR: ÷ 8` cuando se admiten. No debe aplicarse una conversión genérica de unidades heterogéneas sin regla verificable.
+
+### 7.2. Reconstrucción del precio de mercado por APU
+
+El motor `_post_process_market_financials()` calcula los insumos de materiales, MO y maquinaria, reconstruye bases porcentuales y cargos conforme al diseño del APU original, y lleva el resultado a un P.U. de mercado del **servicio**.
+
+**RN-015. Porcentajes auxiliares.** Herramienta menor, EPP y cargos porcentuales siguen las bases reales de la matriz y, cuando procede, la evidencia de fórmulas; no se calculan sobre una base arbitraria.
+
+**RN-016. Indirectos y utilidad.** En esta comparación, los porcentajes de indirectos, financiamiento y utilidad proceden del **APU del contratista**. No se sustituye automáticamente el indirecto por un **25 % fijo**; ese valor corresponde a otros escenarios de presupuesto base.
+
+**RN-017. Conciliación.** Si fórmulas, rendimientos o subtotales no pueden reconciliarse razonablemente, debe exponerse un estado de advertencia como «No conciliable mercado», en lugar de inventar una composición válida.
+
+### 7.3. Comparativa por servicio
+
+```text
+Importe ofertado = P.U. ofertado del servicio × cantidad del catálogo
+Importe mercado  = P.U. de mercado del APU × cantidad del catálogo
+Diferencia ($)   = Importe ofertado − Importe mercado
+Diferencia (%)   = (Importe ofertado ÷ Importe mercado) − 1
+                  [solo si importe de mercado > 0]
+```text
+
+La cantidad usada para **ambos lados** es la del catálogo de conceptos. El vínculo entre APU y servicio se basa en códigos y puentes canónicos, con respaldo de orden, unidad, cantidades e importes cuando es necesario.
+
+### 7.4. Registros sin precio independiente
+
+En el parsing inicial existe una ruta que deja el **P.U. e importe de mercado granular en cero** cuando no se encuentra referencia adecuada, a la vez que registra `provider_fallback` / «Sin referencia de mercado». Ese **cero no es un precio comercial observado** ni debe presentarse como cobertura completa.
+
+Una decisión histórica confirmada de tipo **Proveedor** puede llevar a emplear explícitamente el precio del contratista actual. Debe diferenciarse este fallback decidido del **cero provisional por falta de referencia**, y visualizar la cobertura en el dashboard.
+
+## 8. Revisión del analista y estados
+
+**RN-018. Confirmación:** todo insumo propuesto inicialmente, incluso por catálogo exacto, inicia pendiente hasta que el analista lo confirme o guarde una edición económica.
+
+**RN-019. Omitir:** un agrupador, duplicado, error del contratista u otro insumo fuera de revisión puede omitirse con motivo y **una** confirmación. La omisión **no elimina el renglón del APU ni cambia su importe**; solo lo excluye del requisito de validación.
+
+**RN-020. Borrador único:** el interruptor «Confirmado» y las modificaciones de mercado participan del contador original «insumos modificados sin guardar». Un insumo con varios cambios se cuenta una vez; revertir una confirmación pendiente debe ajustar el contador.
+
+**RN-021. Continuidad de trabajo:** tener borradores pendientes no bloquea editar ni confirmar otros insumos, pero sí impide finalizar el mercado.
+
+**RN-022. Guardado y versiones:** guardar una edición económica crea revisión; guardar solo confirmaciones puede persistir sin generar un nuevo Excel/revisión económica. Los ajustes previos permanecen recuperables.
+
+**RN-023. Cierre:** «Finalizar edición de mercado» se habilita solo si la totalidad de los insumos únicos evaluables está **Confirmada u Omitida** y no existen cambios sin guardar. El servidor debe volver a verificarlo. Una corrida cerrada rechaza futuras escrituras de mercado, inclusive por API; la reapertura es excepcional y exclusiva de Super Admin con motivo.
+
+## 9. Criterios de aceptación para QA
+
+| ID | Escenario | Resultado esperado |
+|---|---|---|
+| CA-01 | Un insumo se repite en múltiples APU del mismo proveedor. | Se propone una referencia técnica única; las operaciones/cantidades de cada aparición permanecen propias. |
+| CA-02 | Candidato tiene mismo nombre general, pero calibre diferente. | No se acepta automáticamente como equivalente. |
+| CA-03 | No hay referencia de mercado independiente. | Se identifica falta de cobertura; cero provisional no se presenta como precio verificado. |
+| CA-04 | Se obtiene candidato vía Claude/Voyage. | El precio aplicado corresponde al catálogo trazable, no a un número inventado por IA. |
+| CA-05 | Se recupera una elección de corrida anterior. | El precio puede reutilizarse, pero el insumo comienza pendiente de confirmación en la corrida actual. |
+| CA-06 | Se modifica un precio y luego se confirma otro insumo. | Se permiten ambas operaciones antes de «Guardar todos los cambios». |
+| CA-07 | Se confirma y desconfirma una referencia sin guardar. | El borrador se revierte y el contador se actualiza. |
+| CA-08 | Se omite un agrupador. | Se registra motivo; no se modifica precio ni se elimina del APU. |
+| CA-09 | Hay al menos un borrador pendiente. | «Finalizar» está bloqueado, pero el análisis puede seguir. |
+| CA-10 | Se cierra una corrida y se intenta POST de edición. | Backend rechaza escritura; otras corridas continúan operativas. |
+| CA-11 | Un precio de Maquinaria está en HOR y el APU en JOR. | Validar la conversión concreta en la ruta automática y en la manual; no asumir que ambas son idénticas. |
+
+## 10. Referencias de código
+
+- `backend/real_data.py`: parsing, cálculo de importes, normalización y conciliación, enlace APU–catálogo.
+- `backend/market_matching.py`: búsqueda local, evaluación técnica, selección y alertas.
+- `backend/market_groups.py`: grupos de insumos equivalentes.
+- `backend/market_memory.py`: decisiones heredadas.
+- `backend/market_workflow.py`: confirmaciones, omisiones y cierre.
+- `backend/comparison_dashboard.py`: cobertura, KPI y visualización económica.
+
+**Condición de validez:** reglas descritas a partir de inspección estática de V1.5.62; no representan la verificación de una corrida real ni garantizan la exactitud de un precio particular.

@@ -1,0 +1,348 @@
+---
+title: "Integraciones, IA y arquitectura"
+description: "Contratos con Voyage y Claude, endpoints FastAPI, caché, diagnóstico y trazabilidad."
+sidebarTitle: "Integraciones e IA"
+---
+
+**Producto:** Chanix IA · Comparador APU  
+**Versión documentada:** V1.5.62  
+**Tipo de página:** Especificación técnica / Integraciones  
+**Páginas relacionadas:** [01 · Información general y flujo](/comparativa/informacion-general-y-flujo) · [02 · Reglas de negocio y cálculo](/comparativa/reglas-de-negocio-y-calculo)
+
+<Info>
+
+**Alcance de evidencia:** esta página documenta las rutas y contratos identificados en el código ensamblado de V1.5.62. Los ejemplos muestran estructuras de solicitudes, **no payloads capturados de una corrida real**. No se inspeccionaron credenciales, facturación ni logs efectivos de Railway; por ello, toda llamada marcada como opcional depende de la configuración de producción.
+
+</Info>
+
+## 1. Arquitectura lógica
+
+```mermaid
+flowchart LR
+    UI[Frontend · app.js] --> API[FastAPI · main.py]
+    API --> UP[Validación de Excel]
+    UP --> PAR[Parser · real_data.py]
+    PAR --> CAT[ReferenceCatalog · Construbase/OPUS]
+    PAR --> MAT[HybridMatcher]
+    MAT --> CA[(Caché SQLite)]
+    MAT --> VI[(Índice Voyage .npz)]
+    MAT -. Embedding / Rerank .-> VOY[Voyage API]
+    MAT -. Descubrimiento / Selección .-> CLA[Anthropic Claude API]
+    PAR --> FIN[Motor financiero APU]
+    FIN --> STO[(RunStorage · snapshots)]
+    STO --> REP[Excel + Dashboard]
+    API -. Diagnóstico opcional .-> DIA[Anthropic u OpenAI]
+    API --> WF[(Workflow de confirmación/cierre)]
+```text
+
+El **matching de catálogo** y el **diagnóstico ejecutivo** son integraciones distintas. El primero se ejecuta para resolver insumos elegibles; el segundo interpreta resultados financieros ya calculados y puede invocarse desde la generación de reportes u otras consultas.
+
+## 2. Endpoints principales de Chanix
+
+| Método | Endpoint | Función | ¿Puede modificar una corrida? |
+|---|---|---|---|
+| `POST` | `/api/comparisons/validate-upload` | Prevalidar conceptos y APU antes del análisis | No crea la corrida |
+| `POST` | `/api/comparisons/real-run` | Crear y ejecutar la comparativa completa | Sí, crea nueva corrida |
+| `GET` | `/api/real-runs/{id}/dashboard` | Consultar dashboard y diagnóstico asociado | Lectura; diagnóstico externo opcional según ruta/configuración |
+| `GET` | `/api/real-runs/{id}/market-candidates` | Consultar insumos únicos, estado y alternativas | No |
+| `GET` | `/api/real-runs/{id}/market-catalog/search` | «Buscar otra referencia» en catálogos locales | No |
+| `GET` | `/api/real-runs/{id}/market-draft` | Consultar borradores pendientes | No |
+| `POST` | `/api/real-runs/{id}/market-candidates/batch` | Guardar referencia/precio y confirmaciones | Sí, puede crear revisión económica |
+| `GET` | `/api/real-runs/{id}/market-workflow` | Consultar validaciones, omisiones y cierre | No |
+| `POST` | `/api/real-runs/{id}/market-validation` | Operación de workflow de estado; la UI V1.5.62 la integra al guardado unificado | Sí, estado de validación; no hace repricing por sí misma |
+| `POST` | `/api/real-runs/{id}/market-finalize` | Finalizar edición de mercado | Sí, cierra para escritura |
+| `POST` | `/api/real-runs/{id}/market-reopen` | Reabrir excepcionalmente | Sí, solo Super Admin y motivo |
+| `GET` | `/api/real-runs/{id}/report` | Obtener/generar el reporte Excel | No modifica cotización; puede generar artefacto/diagnóstico |
+| `GET` | `/api/real-runs/{id}/professional-diagnostic` | Obtener diagnóstico profesional | No edita precios; puede consultar IA externa |
+
+Las operaciones de escritura están sujetas a autorización de usuario y de corrida. Una corrida cerrada debe rechazar nuevas escrituras económicas y de confirmación aun si se llama directamente al API.
+
+## 3. Cadena de matching y servicios externos
+
+### 3.1. Primero: búsqueda local y caché
+
+El matcher construye una clave SHA-256 que incluye descripción del insumo, tipo, unidad, contexto APU, P.U. del proveedor, huella de los catálogos, configuración de modelos y disponibilidad de servicios. Consulta una caché en memoria y SQLite (`CHANIX_MATCH_CACHE_DB`).
+
+Una respuesta vigente reutilizable evita llamadas adicionales a IA. Los resultados degradados/negativos tienen caducidad breve (predeterminado `CHANIX_DEGRADED_CACHE_TTL_SECONDS=600`). El índice de catálogos y las decisiones anteriores deben invalidarse o actualizarse si cambian los datos relevantes.
+
+La ruta local busca candidatos en **Construbase y OPUS**, filtra por especificaciones y unidad, y crea un conjunto técnico candidato. Si hay suficiente evidencia, el precio se obtiene del registro de catálogo **sin necesidad de Claude**.
+
+### 3.2. Voyage — Indexación administrativa, no por clic
+
+**Servicio:** Voyage Embeddings  
+**Endpoint:** `POST https://api.voyageai.com/v1/embeddings`  
+**Modelo predeterminado identificado:** `voyage-4`  
+**Momento:** operación administrativa para construir/actualizar un índice de mercado.
+
+**Datos que salen:** textos de referencias del catálogo (descripción, unidad y tipo), en lotes de hasta 256, con tamaño predeterminado de 128. No se envían matrices APU completas para indexar el catálogo.
+
+```json
+{
+  "input": [
+    "<descripción referencia 1> | unidad <unidad 1> | tipo <tipo 1>",
+    "<descripción referencia 2> | unidad <unidad 2> | tipo <tipo 2>"
+  ],
+  "model": "voyage-4",
+  "input_type": "document"
+}
+```text
+
+**Respuesta / persistencia:** vectores semánticos asociados a registros de catálogo. Chanix guarda checkpoints/caché de embeddings en SQLite y publica un archivo `.npz` de índice; verifica huella de catálogo, modelo y orden de referencias antes de reutilizarlo. Cambiar el Excel `construdata-102026.xlsx` puede invalidar el índice antiguo y obliga a reconstruirlo administrativamente para disponer otra vez de esa capacidad.
+
+### 3.3. Voyage — Embedding de una consulta APU
+
+**Endpoint:** `POST https://api.voyageai.com/v1/embeddings`  
+**Modelo predeterminado:** `voyage-4`  
+**Cuándo:** durante matching, si existe índice válido, credencial y presupuesto de llamadas.
+
+```json
+{
+  "input": [
+    "Insumo: <descripción del renglón APU>. Uso en servicio de obra: <contexto resumido del APU>"
+  ],
+  "model": "voyage-4",
+  "input_type": "query"
+}
+```text
+
+**Datos enviados:** descripción del insumo y, cuando existe, contexto acotado del servicio (hasta unos 120 caracteres según el contrato auditado). **No** se envía de nuevo todo el Excel de mercado en esta operación. El backend compara el vector de consulta con el índice local y aplica posteriormente filtros técnicos.
+
+### 3.4. Voyage — Rerank de candidatos
+
+**Endpoint:** `POST https://api.voyageai.com/v1/rerank`  
+**Modelo predeterminado:** `rerank-3`  
+**Cuándo:** hay candidatos locales y credenciales/presupuesto para ordenarlos. El rerank puede operar aunque no esté disponible el índice vectorial completo.
+
+```json
+{
+  "query": "<descripción insumo + contexto APU>",
+  "documents": [
+    "<descripción candidato 1> | unidad <unidad> | tipo <tipo>",
+    "<descripción candidato 2> | unidad <unidad> | tipo <tipo>"
+  ],
+  "model": "rerank-3",
+  "top_k": 2
+}
+```text
+
+El backend envía un máximo de **40 descripciones candidatas**. Voyage devuelve índices y puntajes de relevancia que Chanix relaciona con registros **ya existentes**. No se usa `relevance_score` como certificación de calidad económica ni se permite que Voyage cree códigos o precios.
+
+### 3.5. Claude — Descubrimiento de búsquedas de catálogo
+
+**Servicio:** Anthropic Messages  
+**Endpoint:** `POST https://api.anthropic.com/v1/messages`  
+**Modelo predeterminado:** `claude-haiku-4-5-20251001`  
+**Cuándo:** no se consiguió candidato combinado y `CHANIX_CLAUDE_DISCOVERY` está habilitado con credencial disponible.
+
+El backend envía la **descripción del renglón APU**, unidad, tipo y restricciones técnicas. Claude utiliza la herramienta `search_construdata` para sugerir hasta **tres consultas**; **no consulta Internet**. El servidor ejecuta esas cadenas contra los catálogos locales y vuelve a validar cada resultado.
+
+```json
+{
+  "model": "claude-haiku-4-5-20251001",
+  "temperature": 0,
+  "max_tokens": 240,
+  "tool_choice": {"type": "tool", "name": "search_construdata"},
+  "tools": [
+    {
+      "name": "search_construdata",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "queries": {"type": "array", "items": {"type": "string"}, "maxItems": 3}
+        },
+        "required": ["queries"]
+      }
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "<descripción, unidad, tipo y restricciones: calibre/perfil/espesor/medidas>"}
+  ]
+}
+```text
+
+**No se envían:** archivo Excel íntegro, catálogos completos, listado global de precios. **Se envían:** atributos de un insumo y las restricciones necesarias para formular consultas técnicas.
+
+### 3.6. Claude — Decisión técnica entre referencias
+
+**Endpoint:** `POST https://api.anthropic.com/v1/messages`  
+**Modelo predeterminado:** `claude-haiku-4-5-20251001`  
+**Cuándo:** existen candidatos plausibles, pero hay ambigüedad, competencia entre fuentes o anomalía de precio.
+
+Claude recibe descripción APU, unidad, tipo, contexto de obra, **P.U. del contratista** y un máximo de **ocho candidatos** existentes con sus unidades, tipos, precios de catálogo y origen.
+
+```json
+{
+  "model": "claude-haiku-4-5-20251001",
+  "temperature": 0,
+  "max_tokens": 220,
+  "tool_choice": {"type": "tool", "name": "choose_reference"},
+  "messages": [
+    {
+      "role": "user", "content": "<insumo APU + contexto + contractor_price + hasta 8 candidatos con catalog_price>"}
+  ]
+}
+```text
+
+**Contrato de salida de `choose_reference`:**
+
+```json
+{
+  "candidate_id": 0,
+  "assessment": "equivalent",
+  "technical_score": 85,
+  "reason": "<justificación técnica>"
+}
+```text
+
+Los valores del ejemplo son ilustrativos. `candidate_id=-1` significa que ninguna referencia es adecuada. Cada candidato enviado al modelo contiene `id`, `description`, `unit`, `kind`, `source` y `catalog_price`.
+
+**Restricciones obligatorias del servidor:**
+
+- Solo se acepta un `candidate_id` que exista en la lista presentada a Claude.
+- Se veta cualquier incompatibilidad técnica de referencia.
+- Una decisión de Claude con `technical_score < 60` no debe ser aceptada como elección válida.
+- `contractor_price` sirve para detectar anomalías, **no para elegir la referencia económicamente más cercana**.
+- El P.U. aplicado se obtiene del catálogo seleccionado y, cuando corresponde, de una conversión explícitamente permitida.
+
+**Implicación de confidencialidad:** esta llamada puede transmitir **descripciones propias del contratista, contexto APU, P.U. ofertado y P.U. de candidatos Construbase/OPUS**. Aunque no se envíe el Excel completo, la información transmitida puede ser comercialmente sensible.
+
+## 4. Diagnóstico ejecutivo mediante IA (flujo distinto)
+
+**Variable habilitadora:** `ENABLE_AI_ANALYSIS=1` (predeterminado **desactivado** en código).  
+**Proveedor configurable:** `AI_ANALYSIS_PROVIDER=anthropic` o `openai`.  
+**Modelos predeterminados:** Anthropic `claude-haiku-4-5` / OpenAI `gpt-4o-mini` según proveedor.  
+**Tiempo límite predeterminado:** 25 segundos.
+
+### 4.1. Datos compartidos
+
+El backend genera **primero** los resultados económicos. Después puede enviar un JSON resumido con:
+
+- Nombre de proyecto, identificador de corrida y proveedores.
+- Totales ofertados y de mercado, diferencias y porcentajes.
+- Número de conceptos y cobertura de referencias de mercado.
+- Costos por sección y componentes relevantes del APU.
+- Conceptos de mayor peso y alertas detectadas (predeterminado hasta 12 por bloque/proveedor).
+
+No se pide al modelo calcular un mercado desde cero ni crear cifras. El prompt exige mantener la base económica proporcionada.
+
+### 4.2. Dos modalidades identificadas
+
+| Modalidad | Entrada | Respuesta solicitada | Observación |
+|---|---|---|---|
+| Diagnóstico narrativo | JSON de contexto, truncado aproximadamente a 26.000 caracteres | `sections[]` con seis bloques de texto | El dashboard puede conservarlo en caché de memoria por `runId`. |
+| Diagnóstico profesional | Contexto calculado + esquema fallback local, truncado aproximadamente a 36.000 caracteres | JSON con titular, KPI, prioridades, materiales/MO/equipo, riesgos y dictamen | Puede reutilizarse para «Métricas de Riesgo» y la API de diagnóstico; no tiene caché externa global garantizada. |
+
+En la modalidad profesional el contrato contempla hasta 3.500 tokens de salida con Anthropic y JSON estructurado (`response_format: json_object`) cuando el proveedor es OpenAI. Si no hay IA, falla la conexión o la función está desactivada, se utiliza un **diagnóstico local determinístico**.
+
+**Costos:** una misma corrida puede generar varias llamadas de diagnóstico si se producen varios artefactos. El máximo de llamadas Claude del matcher **no cubre estas llamadas**. No debe suponerse una sola llamada total por comparación.
+
+## 5. Configuración relevante
+
+| Variable de entorno | Valor predeterminado en código | Uso |
+|---|---|---|
+| `VOYAGE_API_KEY` | Sin valor | Habilita Voyage cuando existe índice/presupuesto. |
+| `ANTHROPIC_API_KEY` | Sin valor | Permite Claude para matching y, según flags, diagnóstico. |
+| `CHANIX_CLAUDE_DISCOVERY` | `1` | Permite descubrimiento de términos con Claude si está disponible. |
+| `CHANIX_CLAUDE_MATCH_MODEL` | `claude-haiku-4-5-20251001` | Modelo de matching. |
+| `CHANIX_VOYAGE_EMBED_MODEL` | `voyage-4` | Modelo embedding de índice y consulta. |
+| `CHANIX_VOYAGE_RERANK_MODEL` | `rerank-3` | Modelo de rerank. |
+| `CHANIX_MAX_CLAUDE_CALLS_PER_RUN` | `60` | Presupuesto de llamadas Claude para matching por objeto catálogo/corrida. |
+| `CHANIX_MAX_VOYAGE_CALLS_PER_RUN` | `1000` | Presupuesto de llamadas Voyage para matching. |
+| `CHANIX_MATCH_CACHE_DB` | `data/market_matching_v2.sqlite3` | Caché de matching. |
+| `CHANIX_VOYAGE_INDEX_PATH` | `data/market_vectors_v2.npz` | Índice vectorial reutilizable. |
+| `CHANIX_DEGRADED_CACHE_TTL_SECONDS` | `600` | Caducidad predeterminada de matching degradado/negativo. |
+| `CHANIX_PRICE_ANOMALY_RATIO` | `3.0` | Umbral de alerta de diferencia de precio. |
+| `ENABLE_AI_ANALYSIS` | `0` | Diagnóstico externo habilitado o deshabilitado. |
+| `AI_ANALYSIS_PROVIDER` | Según configuración | Anthropic / OpenAI para diagnóstico. |
+| `AI_ANALYSIS_MODEL` | Según proveedor | Modelo de diagnóstico. |
+| `AI_ANALYSIS_MAX_INPUT_ITEMS` | `12` | Elementos destacados de contexto para diagnóstico. |
+| `CHANIX_RUN_STORAGE_DIR` | `backend/runtime` | Almacenamiento persistente de corridas, compatible con Volume de Railway si se configura. |
+
+**Importante:** estos son valores por defecto **observados en el código**, no una declaración de las variables actualmente configuradas en Railway. No se deben publicar API keys ni secretos en la wiki.
+
+## 6. Persistencia, historial y seguridad
+
+**Snapshots económicos.** `RunStorage` mantiene el modelo canónico de la corrida y sus revisiones. La actualización de precios/referencias genera una **nueva revisión vinculada**, conservando el historial anterior.
+
+**Workflow de mercado.** `market_workflow.py` mantiene confirmaciones, omisiones y estado de cierre por corrida, separado de la estructura económica. Confirmar sin cambiar precio no exige crear revisión económica nueva. La edición del precio sí puede generar nueva revisión.
+
+**Borrador en V1.5.62.** El frontend presenta un contador único «insumos modificados sin guardar» que cubre cambios de mercado y confirmaciones. Se pueden revisar otros insumos mientras el borrador existe. El cierre exige guardar previamente y que todos los insumos estén confirmados u omitidos.
+
+**Cierre inmutable al nivel de API.** Después de finalizar, el servidor rechaza modificaciones de precio, referencia o validación. La reapertura por Super Admin requiere motivo y debe quedar auditada.
+
+**Aislamiento.** IDs de corrida, permisos de usuario y vínculo con organización deben validarse del lado del backend, independientemente de lo que muestra la interfaz. No se debe escribir un mercado en otra corrida por coincidencia de códigos o proveedor.
+
+**Datos comerciales.** Cuando se habilitan integraciones de IA, es necesario considerar contrato, retención, políticas de proveedores y auditoría de información comercial compartida. No guardar prompts completos con datos confidenciales en logs de aplicación sin una política explícita.
+
+## 7. Qué ocurre cuando falla la IA
+
+| Incidencia | Comportamiento esperado de la ruta documentada |
+|---|---|
+| Voyage sin clave | Continúa búsqueda local; no hay embedding/rerank externo por esa ruta. |
+| Índice Voyage incompatible o ausente | No utilizar vectores desactualizados; puede seguir matching léxico y rerank con candidatos si está habilitado. |
+| Claude sin clave o límite alcanzado | No inventar candidatos; conservar resultado local o sin referencia adecuada. |
+| Claude devuelve candidato fuera de lista | El backend lo rechaza. |
+| Claude devuelve incompatibilidad o puntaje insuficiente | No aplicar la referencia como válida. |
+| No hay referencia independiente | Registrar falta de cobertura y origen/estado correspondiente; no fingir un precio observado. |
+| Diagnóstico externo desactivado/fallido | Elaborar diagnóstico local determinístico. |
+| Buscar Internet | La función de interfaz continúa deshabilitada en V1.5.62; no forma parte del flujo obligatorio. |
+
+## 8. Riesgos técnicos y puntos que deben verificarse
+
+| ID | Riesgo identificado en lectura de código | Validación recomendada |
+|---|---|---|
+| RT-01 | La ruta inicial puede registrar mercado granular cero cuando no encuentra referencia independiente. | Verificar cobertura y que el dashboard no lo interprete como precio verificado. |
+| RT-02 | La conversión `HOR/JOR` para Maquinaria no tiene idéntica implementación en el matching automático y la selección manual. | Prueba de regresión con un registro real de Maquinaria y ambas unidades. |
+| RT-03 | Actualizar el Excel consolidado invalida el índice semántico anterior. | Revisar huella/estado del `.npz`; reconstruirlo administrativamente si procede. |
+| RT-04 | Se pueden repetir llamadas de diagnóstico durante exportaciones o consultas. | Registrar por corrida/modelo la cantidad de llamadas y tokens; cachear por snapshot si se aprueba. |
+| RT-05 | Ciertas solicitudes IA incluyen P.U. ofertados y contexto de proyecto. | Auditar tratamientos de datos y minimización del contenido externo. |
+| RT-06 | Parsing tiene límites de hasta 1.500 filas de conceptos, 20.000 filas matriz y 6.000 renglones canónicos de salida por matriz. | Probar archivos reales de gran tamaño y casos multiformato. |
+| RT-07 | El flujo real depende de credenciales, flags, versión desplegada e índice vigente. | Validar logs y configuración efectiva sin revelar secretos. |
+
+**Clasificación:** estos son riesgos o límites identificados por inspección estática; **no deben registrarse como incidencias reproducidas en producción sin prueba adicional**.
+
+## 9. Observabilidad recomendada para auditoría
+
+Para cada corrida/proveedor registrar métricas **sin almacenar indiscriminadamente texto confidencial de los prompts**:
+
+| Fase | Indicadores propuestos |
+|---|---|
+| Excel | Archivos/hojas detectados, filas de catálogo y APU, advertencias, tiempo de parsing. |
+| Matching | Insumos únicos, hits de caché, matching exacto/local/Voyage/Claude, faltantes y parciales. |
+| Voyage | Modelo, hash/estado del índice, embeddings/reranks, errores y tokens. |
+| Claude | Modelo, llamadas de descubrimiento y evaluación, candidato elegido/no elegido, errores/tokens. |
+| Mercado | Cobertura independiente por categoría, fallbacks, ceros provisionales, desviaciones y conciliación. |
+| Diagnóstico | Proveedor/modelo, modalidad, activación, llamadas, fallback local, duración y costos. |
+| Analista | Confirmados, omitidos, borradores, nueva revisión, usuario y momento de cierre. |
+
+Sin estas evidencias es posible describir las **rutas de código** pero no responder, para una corrida específica, «¿qué candidatos vio Claude?», «¿por qué decidió esa referencia?» o «¿qué modelo se ejecutó realmente?».
+
+## 10. Mapa de código para mantenimiento
+
+| Archivo | Responsabilidad |
+|---|---|
+| `frontend/assets/app.js` | Clic «Analizar comparativa», prevalidación, formularios, dashboard y grilla. |
+| `backend/main.py` | FastAPI, creación y recuperación de corridas, diagnóstico, Excel, guardado, cierre y autorización. |
+| `backend/upload_validation.py` | Seguridad y compatibilidad de los archivos Excel. |
+| `backend/real_data.py` | `parse_concepts`, `parse_matrix`, catálogo de referencias, cálculo y asociación con conceptos. |
+| `backend/market_matching.py` | Matcher híbrido, Voyage, Claude, caché, filtros técnicos y alertas. |
+| `backend/voyage_index.py` | Indexación, checksums, checkpoints SQLite y archivo `.npz`. |
+| `backend/market_memory.py` | Reutilización de decisiones previas y control de compatibilidad. |
+| `backend/market_groups.py` | Agrupación de insumos equivalentes para revisión. |
+| `backend/market_workflow.py` | Confirmar, omitir, cerrar y reabrir. |
+| `backend/comparison_dashboard.py` | Indicadores de mercado, KPIs y análisis visual. |
+| `backend/run_storage.py` | Snapshots persistidos e historial de revisiones. |
+
+## 11. Checklist de verificación de entorno antes de una auditoría real
+
+- [ ] Confirmar el commit o etiqueta desplegada corresponde efectivamente a V1.5.62.
+- [ ] Revisar qué Excel de Construbase y OPUS quedaron activos y su huella.
+- [ ] Confirmar si existe un índice Voyage vigente y de qué modelo.
+- [ ] Identificar flags de habilitación IA, sin exponer secretos.
+- [ ] Obtener trazas agregadas de matching, caché, errores y llamadas externas.
+- [ ] Confirmar integridad de Volume y versión última de la corrida elegida.
+- [ ] Verificar que un precio de catálogo no fue normalizado incorrectamente en unidades HOR/JOR.
+- [ ] Auditar cambios y confirmaciones humanas antes del cierre del mercado.
+- [ ] Contrastar totales y cobertura de mercado frente a Excel y Dashboard.
+
+**Nota final:** «Buscar otra referencia» es una búsqueda manual de catálogos, **distinta** del matching híbrido efectuado al pulsar «Analizar comparativa». La herramienta `search_construdata` de Claude propone búsquedas en **catálogos locales**, no búsquedas abiertas en Internet.
